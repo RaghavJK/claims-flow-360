@@ -1,24 +1,12 @@
 # ClaimsFlow360 — Insurance Claims Processing Platform
 
-**Project #1 of the 5-project Senior Cloud / Platform Architect portfolio.**
+An Insurance Claims Processing Platform that demonstrates CQRS, DDD bounded contexts, state machines, fraud scoring, and AI augmentation.
+
 Domain: **BFSI (Insurance)** · Architecture: **Modular Monolith + CQRS** · Complexity: **Enterprise-Grade**
 
 ---
 
-## Strategic Purpose
-
-This is the **anchor project** for the portfolio. It leverages the exact stack
-I own day-to-day at Lincoln Financial Group (Java 21, Spring Boot 3, AWS,
-OpenSearch, Bedrock, Resilience4j) so interview depth is unquestionable. It
-demonstrates CQRS, DDD bounded contexts, state machines, fraud scoring, and
-AI augmentation in a domain where I have firsthand production experience.
-
----
-
-## Full Target Architecture (30-week vision)
-
-> This is the eventual shape of the project across multiple build weeks. The
-> **Week 1 Scope** section below scopes down to a realistic vertical slice.
+## Full Target Architecture
 
 ### Technology Stack
 
@@ -75,7 +63,7 @@ Layer protects the core domain from external data models.
 
 ---
 
-## 🎯 Week 1 Scope (this commit)
+## 🎯 Week 1 Scope
 
 A runnable, tested **vertical slice** of the system. Every line is real code,
 not placeholders — just narrower in surface area than the full vision.
@@ -243,11 +231,3 @@ curl -X POST http://localhost:8080/api/v1/claims \
 ```
 
 ---
-
-## Interview Talking Points (Week 1 slice)
-
-1. **Why modular monolith first?** — deployment simplicity, strict package boundaries enforce bounded contexts, and it migrates cleanly to microservices if scale demands. No distributed-transaction overhead.
-2. **Why enum state machine over full GoF State pattern?** — pragmatic Week 1 decision. The enum + transition map gives identical invariant enforcement and audit characteristics with 1/5 the code. The spec's State/Memento is equivalent when events are already persisted (which they are here).
-3. **Why Chain of Responsibility for fraud?** — each indicator is independent, testable in isolation, and addable without touching existing code. Spring auto-discovers all `FraudIndicator` beans — zero configuration to add a 4th, 5th, or 15th indicator.
-4. **Why transactional outbox (even stubbed)?** — it's the only way to reliably publish events across a DB + external broker without 2PC. The stub already enforces the correct call sites so Week 2's real SQS writer is a drop-in.
-5. **Why field-level JWT validation over issuer-URI in dev?** — no external dependency for local smoke tests. Production profile swaps in the real Cognito/Okta issuer URI.
