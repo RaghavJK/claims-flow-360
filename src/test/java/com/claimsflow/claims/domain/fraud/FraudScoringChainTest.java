@@ -16,10 +16,10 @@ class FraudScoringChainTest {
 
     @Test
     void cleanIndicatorsProduceZeroScore() {
-        FraudScoringChain chain = new FraudScoringChain(List.of(
-                claim -> FraudIndicatorResult.clean("A"),
-                claim -> FraudIndicatorResult.clean("B")
-        ).stream().map(FraudScoringChainTest::asIndicator).toList());
+        List<FraudIndicator> indicators = List.of(
+                stub("A", FraudIndicatorResult.clean("A")),
+                stub("B", FraudIndicatorResult.clean("B")));
+        FraudScoringChain chain = new FraudScoringChain(indicators);
 
         FraudScoreResult result = chain.score(sampleClaim(new BigDecimal("100")));
         assertThat(result.totalScore()).isZero();
@@ -80,5 +80,4 @@ class FraudScoringChainTest {
         };
     }
 
-    private static FraudIndicator asIndicator(FraudIndicator fn) { return fn; }
 }

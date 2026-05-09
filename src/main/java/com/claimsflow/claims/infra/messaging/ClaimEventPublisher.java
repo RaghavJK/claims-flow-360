@@ -1,21 +1,22 @@
 package com.claimsflow.claims.infra.messaging;
 
 import com.claimsflow.claims.domain.ClaimEvent;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.stereotype.Component;
 
 /**
- * Publishes domain events for CQRS read-model projection and downstream consumers.
+ * Port for publishing domain events out of the claims bounded context.
  *
- * <p>Week 1 is a stub that only logs. The real implementation (transactional
- * outbox → SQS → OpenSearch projection) is on the Week 2+ backlog.
+ * <p>Two implementations exist:
+ * <ul>
+ *   <li>{@code test} profile → {@link LoggingClaimEventPublisher} (logs, no I/O)</li>
+ *   <li>{@code !test} profile → {@link OutboxClaimEventPublisher} (writes to outbox_events table,
+ *       relayed asynchronously to SQS by {@link com.claimsflow.claims.infra.outbox.OutboxRelayScheduler})</li>
+ * </ul>
  */
-@Slf4j
-@Component
-public class ClaimEventPublisher {
+public interface ClaimEventPublisher {
 
-    public void publish(ClaimEvent event) {
-        log.info("[outbox-stub] publishing claim event type={} claimId={} from={} to={}",
-                event.getEventType(), event.getClaimId(), event.getFromStatus(), event.getToStatus());
-    }
+    /**
+     * Publishes a domain event. Must be called within an active transaction so
+     * the outbox write is atomic with the business data write.
+     */
+    void publish(ClaimEvent event);
 }

@@ -29,8 +29,8 @@ spring:
     oauth2:
       resourceserver:
         jwt:
-          # Replace with real issuer-uri (e.g. Cognito) in production.
-          # For local dev, JWTs are validated via a static HMAC secret in SecurityConfig.
+          # Replace with real Cognito issuer-uri in production.
+          # For local dev, JWTs are validated via HS256 symmetric secret (see SecurityConfig).
           issuer-uri: ""
 
 server:
@@ -47,6 +47,7 @@ management:
     health:
       show-details: when_authorized
 
+# ─── Resilience4j ────────────────────────────────────────────────────────────
 resilience4j:
   circuitbreaker:
     instances:
@@ -64,15 +65,36 @@ resilience4j:
         waitDuration: 500ms
         exponentialBackoffMultiplier: 2
 
-logging:
-  level:
-    com.claimsflow: INFO
-    org.hibernate.SQL: INFO
-
+# ─── ClaimsFlow360 application config ────────────────────────────────────────
 claimsflow:
   fraud:
     threshold: 70
     amount-high-threshold: 50000
+
   security:
     dev-mode: true
     jwt-secret: "dev-secret-change-me-this-must-be-at-least-256-bits-long-for-hmac"
+
+  # ─── AWS (Week 2) ─────────────────────────────────────────────────────────
+  aws:
+    region: ap-south-1                          # change to your AWS region
+    sqs:
+      claims-events-queue-url: https://sqs.ap-south-1.amazonaws.com/123456789012/claimsflow-events.fifo
+
+  opensearch:
+    endpoint: http://localhost:9200             # local OpenSearch or AWS domain endpoint
+
+  ai:
+    bedrock:
+      model-id: anthropic.claude-3-haiku-20240307-v1:0   # cost-optimised; swap to Sonnet for accuracy
+      max-tokens: 500
+
+  outbox:
+    relay-interval-ms: 2000       # how often the relay scheduler polls outbox_events
+    retry-interval-ms: 30000      # how often failed events are retried
+
+logging:
+  level:
+    com.claimsflow: INFO
+    org.hibernate.SQL: INFO
+    software.amazon.awssdk: WARN   # suppress SDK debug noise
