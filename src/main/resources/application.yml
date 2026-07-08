@@ -4,6 +4,11 @@ spring:
   profiles:
     default: dev
 
+  task:
+    scheduling:
+      pool:
+        size: 4    # outbox relay + outbox retry + reconciliation + dashboard heartbeat
+
   datasource:
     url: jdbc:mysql://localhost:3306/claimsflow?useSSL=false&serverTimezone=UTC&allowPublicKeyRetrieval=true
     username: claims
@@ -80,6 +85,9 @@ claimsflow:
     region: ap-south-1                          # change to your AWS region
     sqs:
       claims-events-queue-url: https://sqs.ap-south-1.amazonaws.com/123456789012/claimsflow-events.fifo
+      consumer:                 # Week 3: long-poll consumer settings
+        wait-time-seconds: 10   # SQS long-poll wait (max 20)
+        max-messages: 10        # batch size per receive (max 10)
 
   opensearch:
     endpoint: http://localhost:9200             # local OpenSearch or AWS domain endpoint
@@ -92,6 +100,15 @@ claimsflow:
   outbox:
     relay-interval-ms: 2000       # how often the relay scheduler polls outbox_events
     retry-interval-ms: 30000      # how often failed events are retried
+
+  # ─── Week 3 ───────────────────────────────────────────────────────────────
+  reconciliation:
+    interval-ms: 21600000         # 6 hours between drift-repair sweeps
+    initial-delay-ms: 60000       # let the app warm up before the first sweep
+    lookback-hours: 7             # overlaps the 6h interval so nothing falls in a gap
+
+  dashboard:
+    broadcast-interval-ms: 10000  # WebSocket metrics heartbeat
 
 logging:
   level:

@@ -20,6 +20,12 @@ public class GlobalExceptionHandler {
                 .body(problem(HttpStatus.NOT_FOUND, "Claim not found", ex.getMessage()));
     }
 
+    @ExceptionHandler(CustomerNotFoundException.class)
+    public ResponseEntity<ProblemDetail> handleCustomerNotFound(CustomerNotFoundException ex) {
+        return ResponseEntity.status(HttpStatus.NOT_FOUND)
+                .body(problem(HttpStatus.NOT_FOUND, "Customer not found", ex.getMessage()));
+    }
+
     @ExceptionHandler(InvalidClaimTransitionException.class)
     public ResponseEntity<ProblemDetail> handleInvalidTransition(InvalidClaimTransitionException ex) {
         return ResponseEntity.status(HttpStatus.CONFLICT)
