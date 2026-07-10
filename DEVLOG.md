@@ -479,6 +479,204 @@ Week 3 next: `@SqsListener` consumer (the other end of the outbox relay), Custom
 ---
 ---
 
+## Week 3 — Closing the CQRS Loop: The SQS Consumer, a Scheduler-Starvation Trap, and Why Money Never Reads from the Search Index
+
+### *The other end of the outbox relay, poison messages vs transient failures, and a Mockito strict-stubbing bug that made my test lie to me*
+
+---
+
+At the end of Week 2, ClaimsFlow360 had a strange gap: the Transactional Outbox faithfully relayed every claim event to SQS FIFO — and *nothing was listening*. The OpenSearch projection only refreshed when someone called a manual REST endpoint. An event-driven architecture where nobody consumes the events is just an expensive audit log.
+
+Week 3 closed the loop. Four deliverables:
+
+1. **SQS long-poll consumer** — events arrive, projections refresh, automatically
+2. **Reconciliation job** — the 6-hour safety net every eventually-consistent system needs
+3. **Customer360** — the aggregated policyholder view (FR-05)
+4. **WebSocket dashboard** — live claim metrics over STOMP (FR-06)
+
+And two genuinely instructive bugs. Let's go.
+
+---
+
+### The Trap: A Long Poll Inside @Scheduled
+
+My first instinct for the consumer was the obvious one — the codebase already had a `@Scheduled` outbox relay, so why not a `@Scheduled` consumer?
+
+```java
+// The trap — DO NOT do this
+@Scheduled(fixedDelay = 1000)
+public void consume() {
+    sqsClient.receiveMessage(ReceiveMessageRequest.builder()
+        .waitTimeSeconds(10)   // ← long poll blocks for up to 10 seconds
+        .build());
+    ...
+}
+```
+
+Here's the problem: Spring Boot's default `TaskScheduler` has a pool size of **one thread**. Every `@Scheduled` method in the application shares it. A long poll that blocks for 10 seconds doesn't just delay itself — it starves *every other scheduled job*. The outbox relay that's supposed to fire every 2 seconds? It now fires whenever the consumer's long poll happens to release the thread. Under sustained event flow, the relay effectively stops.
+
+This is the kind of bug that passes every unit test and only shows up as "events are mysteriously slow in staging."
+
+The fix has two parts. First, the consumer gets its **own dedicated thread** via Spring's `SmartLifecycle`:
+
+```java
+@Component
+@Profile("!test")
+public class ClaimEventSqsConsumer implements SmartLifecycle {
+
+    private final ExecutorService executor = Executors.newSingleThreadExecutor(r -> {
+        Thread t = new Thread(r, "claim-event-sqs-consumer");
+        t.setDaemon(true);
+        return t;
+    });
+    private volatile boolean running;
+
+    @Override
+    public void start() {
+        running = true;
+        executor.submit(this::pollLoop);   // continuous long-poll loop
+    }
+
+    @Override
+    public void stop() {
+        running = false;
+        executor.shutdownNow();            // clean shutdown with the context
+    }
+}
+```
+
+`SmartLifecycle` gives you container-managed startup and shutdown — the loop starts when the Spring context is ready and stops gracefully when it closes. No `@PostConstruct` raciness, no orphaned threads on redeploy.
+
+Second, the scheduler pool got sized properly anyway (`spring.task.scheduling.pool.size: 4`), because by end of week there were four scheduled jobs: outbox relay, outbox retry, reconciliation, dashboard heartbeat. Never let independent background jobs serialize behind each other by default.
+
+---
+
+### Poison vs Transient: Not All Failures Deserve a Retry
+
+At-least-once delivery forces you to answer a question most tutorials skip: *when processing fails, do you delete the message or leave it?*
+
+The answer depends on **why** it failed, and getting it wrong on a FIFO queue is expensive — an undeletable poison message blocks its entire message group forever. That's per-claim ordering working against you.
+
+My consumer discriminates:
+
+| Failure | Classification | Action |
+|---|---|---|
+| Unparseable JSON payload | **Poison** — retrying will never help | Delete + ERROR log (DLQ in prod) |
+| Event references a claim that doesn't exist | **Poison** — outbox rows commit *after* the claim insert, so a missing claim is corruption, not a race | Delete + ERROR log |
+| OpenSearch is down | **Transient** — will heal | Leave on queue; SQS redelivers after the visibility timeout |
+
+The transient case has a subtle bonus: while the message sits on the queue, its FIFO message group is blocked — which means *no later event for that claim can jump ahead*. The "failure mode" is actually the ordering guarantee doing its job.
+
+And idempotency? The projection is an upsert keyed by `claimRef`. Processing the same event twice re-writes the same document. Duplicate delivery is a non-event — which is the only sane way to live with at-least-once semantics.
+
+---
+
+### The Reconciliation Job: Trust, but Verify
+
+Even with the consumer running, an eventually-consistent read model accumulates drift: a poison message deleted without projecting, an OpenSearch outage that outlasts SQS retention, a bug you haven't found yet. You don't hope drift away — you *sweep* it away.
+
+```java
+@Scheduled(fixedDelayString = "${claimsflow.reconciliation.interval-ms:21600000}")  // 6h
+public void reconcile() {
+    Instant since = Instant.now().minus(Duration.ofHours(lookbackHours));  // 7h
+    for (Claim claim : claimRepository.findByUpdatedAtAfter(since)) {
+        try {
+            projectionService.project(claim.getClaimRef());
+        } catch (RuntimeException ex) {
+            log.error(...);   // one bad claim never aborts the sweep
+        }
+    }
+}
+```
+
+Two deliberate numbers: the sweep runs every **6 hours** but looks back **7 hours**. The overlap means a claim updated seconds before a sweep is still covered by the next one. Since re-projecting is idempotent, over-projecting costs a few wasted upserts; under-projecting is silent data drift. Cheap insurance.
+
+---
+
+### Customer360: The Read Model You *Don't* Build on the Search Index
+
+Here's the Week 3 decision I'd defend hardest in an architecture review.
+
+FR-05 calls for an aggregated policyholder view: claim counts, financial totals, fraud exposure. The reflexive CQRS answer is "aggregate it in OpenSearch — that's what the read model is for."
+
+I built it on **MySQL** instead. Deliberately.
+
+The reasoning: the Customer360 view shows a policyholder *their money* — total claimed, total approved. OpenSearch lags the write model by up to ~2 seconds. A customer who just got a claim approved and sees a stale total isn't experiencing "eventual consistency" — they're experiencing a bug, and they'll call support about it. Financial figures shown to their owner must be strongly consistent.
+
+And the cost of the consistent path is trivial: one policyholder has tens of claims, not millions. One indexed query (`findByPolicyNumberOrderByCreatedAtDesc`), one in-memory pass, done.
+
+The rule that falls out of this: **choose the data store per query based on its consistency requirement, not per architecture diagram.** OpenSearch keeps portfolio-wide search and analytics, where 2-second staleness is invisible. MySQL keeps anything with a currency symbol and a name attached.
+
+---
+
+### The WebSocket Dashboard: Two Triggers, One Broadcast
+
+FR-06 wanted live metrics — claims by workflow state, approval rate, fraud exposure. STOMP over WebSocket: clients connect to `/ws`, subscribe to `/topic/metrics`.
+
+The interesting choice was *when to push*. Two triggers feed one broadcaster:
+
+1. **Event-driven** — the SQS consumer broadcasts after every processed claim event. Sub-second dashboard updates when things happen.
+2. **Heartbeat** — a 10-second scheduled broadcast. Dashboards converge even when no events flow (and freshly-connected clients don't stare at nothing).
+
+One more production detail: the broadcast is wrapped in try/catch and *swallows* failures. Losing one dashboard frame is harmless; letting a WebSocket hiccup break SQS event processing is not. Know which of your side effects are load-bearing.
+
+---
+
+### The Bug That Made My Test Lie: Mockito Strict Stubbing
+
+The reconciliation test needed: three claims, the middle one fails to project, the sweep continues. Obvious setup:
+
+```java
+// What I wrote — looks correct, isn't
+doThrow(new RuntimeException("upsert failed"))
+        .when(projectionService).project("CLM-BAD");
+```
+
+The test *ran*. The logs said: `1 re-projected, 2 failed`. Expected: 2 re-projected, 1 failed. Wait — why did CLM-A fail?
+
+Because of **Mockito strict stubbing**. When a mock has a stubbing for `project("CLM-BAD")` and the code calls `project("CLM-A")`, Mockito's default strictness doesn't return quietly — it throws `PotentialStubbingProblem` *from inside the mocked call*. My production code dutifully caught that as a projection failure and kept sweeping. The exception designed to protect my test had become test data.
+
+This is nastier than a normal test bug: resilient production code (catch-and-continue) *absorbs* the framework's complaint, so nothing fails loudly — the counts are just wrong.
+
+The fix — stub the full argument space with one conditional answer, so every call matches a stubbing:
+
+```java
+doAnswer(inv -> {
+    if (inv.getArgument(0).equals("CLM-BAD")) {
+        throw new RuntimeException("upsert failed");
+    }
+    return null;
+}).when(projectionService).project(anyString());
+```
+
+The lesson: when the code under test catches exceptions broadly *and* you're stubbing per-argument behavior on a strict mock, the two interact. Either stub the whole argument space or expect the framework's noise to leak into your assertions.
+
+---
+
+### Scheduling Hygiene: The @EnableScheduling That Was Riding Shotgun
+
+Small refactor with an outsized rationale: `@EnableScheduling` had been sitting on `OutboxRelayScheduler` since Week 2. It worked — but it meant *deleting that one class would silently disable every scheduled job in the application*. The reconciliation sweep, the dashboard heartbeat — all of them owed their existence to an annotation on an unrelated component.
+
+Now there's a dedicated `SchedulingConfig`: one `@Configuration` class whose only job is the cross-cutting switch. Boring code, but the principle matters: **application-wide capabilities never belong on an arbitrary component that happens to use them.**
+
+---
+
+### Week 3 Scoreboard
+
+- **52 tests** (up from 37), still zero real AWS, zero Docker, all green
+- The CQRS loop is closed: write → outbox → SQS → consumer → projection → dashboard push
+- Two new API surfaces: `GET /customers/{policyNumber}/view`, `GET /dashboard/metrics` + `/topic/metrics` over WebSocket
+- Testcontainers integration tests remain deferred — still fighting the Docker Desktop installer
+
+Week 4 next: S3 document upload with Textract OCR, the SNS notification engine with DLQ retries, AES-256 field-level encryption for PII, and JWT auth on the WebSocket CONNECT frame. The platform grows teeth.
+
+---
+
+**Tags:** `#AWS` `#SQS` `#CQRS` `#EventDrivenArchitecture` `#SpringBoot` `#WebSocket` `#Java21` `#Mockito` `#DistributedSystems` `#EventualConsistency` `#InsuranceTech` `#BFSI` `#SoftwareArchitecture` `#TestingPitfalls`
+
+---
+---
+
 ## Architecture Flashcard — Week 1 & 2 Design Decisions at a Glance
 
 ### *Quick-reference for every major decision made in the first two weeks*
@@ -571,20 +769,6 @@ The following is a pre-planned story arc for upcoming weekly posts. Fill in the 
 
 ---
 
-### Week 3 (Draft) — From Relay to Receiver: Building the SQS Consumer + Customer360
-
-**Story hook:** The outbox relay publishes events to SQS. Nobody is listening yet. This week I build the `@SqsListener` consumer that closes the loop — events flow in, projections update, the search index stays fresh automatically. Plus: Customer360 aggregated views and a WebSocket dashboard for real-time claim metrics.
-
-**Technical themes to cover:**
-- `@SqsListener` long-poll consumer with idempotency (what happens when the same event arrives twice)
-- The 6-hour MySQL-to-OpenSearch reconciliation job (drift repair)
-- Customer360 bounded context: aggregating claim history per policyholder with OpenSearch `terms` + `date_histogram` aggregations
-- WebSocket dashboard: Spring WebFlux `@MessageMapping` for live claim cycle-time metrics
-- Testcontainers: MySQL + LocalStack for integration tests (replaces H2 for week 3+ tests)
-- **Bug to discover:** SELECT FOR UPDATE vs. optimistic lock under concurrent relay (multi-instance edge case)
-
----
-
 ### Week 4 (Draft) — Documents, Notifications, and Security Hardening
 
 **Story hook:** Claims don't arrive as JSON payloads in real life — they come with photos, PDFs, and hospital reports. This week I wire S3 document upload + Amazon Textract OCR, build an SNS multi-channel notification engine, and add AES-256 field-level encryption for PII fields.
@@ -594,9 +778,11 @@ The following is a pre-planned story arc for upcoming weekly posts. Fill in the 
 - Amazon Textract async job → SNS callback → structured data extraction
 - SNS fanout → email, SMS, in-app channels; SQS DLQ for failed delivery retries
 - AES-256 field-level encryption for `ssn` and `dob` fields (JPA `@Converter`)
+- JWT auth on the WebSocket CONNECT frame (closing the Week 3 `/ws/**` permitAll)
 - GitLab CI pipeline: build → test → JaCoCo coverage gate → Docker image → EB deploy
 - Spring Security RBAC: `ROLE_ADJUSTER` (read + transition), `ROLE_ADMIN` (full access including denial)
 - AWS Cognito: replacing the HS256 dev JWT with real OAuth2 issuer-uri
+- Testcontainers: MySQL + LocalStack integration tests (carried from Week 3, pending Docker fix)
 
 ---
 

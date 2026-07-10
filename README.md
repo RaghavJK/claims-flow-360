@@ -107,21 +107,31 @@ Anti-Corruption Layer protects the core domain from external data models.
 
 ---
 
-### 🔜 Week 3 — SQS Consumer + Customer360 + WebSocket Dashboard
+### ✅ Week 3 — SQS Consumer + Reconciliation + Customer360 + WebSocket Dashboard (commit `44330cc`)
 
-- `@SqsListener` / SQS long-poll consumer → auto-triggers projection on event arrival
-- 6-hour reconciliation job (drift repair between MySQL and OpenSearch)
-- Customer bounded context (Customer360 view)
-- WebSocket real-time dashboard (claim cycle time, approval/denial ratios, adjuster workload)
-- Testcontainers MySQL + LocalStack integration tests (requires Docker Desktop)
+| Area | Delivered |
+|---|---|
+| **SQS long-poll consumer** | `ClaimEventSqsConsumer` — closes the CQRS loop: receives outbox-relayed events, resolves the claim, auto-refreshes the OpenSearch projection. Runs on a dedicated `SmartLifecycle` thread (a 10 s long-poll inside `@Scheduled` would starve the shared scheduler running the outbox relay) |
+| **Poison vs transient handling** | Unparseable payloads / missing claims → deleted (logged; DLQ in prod). Transient failures (OpenSearch down) → left for visibility-timeout redelivery, preserving per-claim FIFO order |
+| **Reconciliation job** | `SearchReconciliationJob` — 6-hour drift-repair sweep re-projecting claims updated in a 7-hour lookback (overlap ensures no gap); idempotent, continues past individual failures |
+| **Customer360 (FR-05)** | New `customer` bounded context: `GET /api/v1/customers/{policyNumber}/view` — claim counts by status, financial totals, fraud exposure, recent activity. Aggregated from **MySQL** (money totals must be strongly consistent), not the eventually-consistent read model |
+| **WebSocket dashboard (FR-06)** | STOMP at `/ws`, metrics on `/topic/metrics` — pushed on every consumed claim event + a 10 s heartbeat. REST fallback `GET /api/v1/dashboard/metrics` |
+| **Scheduling hygiene** | `SchedulingConfig` centralizes `@EnableScheduling` (was riding on `OutboxRelayScheduler`); scheduler pool sized to 4 so the four background jobs never serialize behind each other |
+| **Tests** | 52 passing (+15 new) — consumer poison/transient paths, reconciliation sweep resilience, Customer360 aggregation, dashboard metrics. Still zero real AWS, zero Docker |
+
+**Week 3 patterns added:** SQS long-poll consumer on dedicated lifecycle thread · Poison-message vs transient-failure discrimination · Scheduled drift reconciliation · Consistency-driven model selection (MySQL for money, OpenSearch for search) · STOMP WebSocket broadcast
+
+**Deferred:** Testcontainers MySQL + LocalStack integration tests (blocked on Docker Desktop install)
 
 ### 🔜 Week 4 — Documents + Notifications + Security hardening
 
 - S3 document upload + Textract OCR integration (FR-07)
 - SNS multi-channel notification engine with SQS DLQ retries (FR-08)
 - AES-256 field-level encryption for SSN/DOB
+- JWT auth on WebSocket CONNECT frames (currently `/ws/**` is permitAll — read-only metrics)
 - Flyway migrations for remaining tables: `policies`, `customers`, `claim_documents`
 - GitLab CI pipeline + JaCoCo coverage gate
+- Testcontainers MySQL + LocalStack integration tests (carried over; requires Docker Desktop)
 
 ---
 
@@ -162,7 +172,8 @@ claimsflow360/
     │   │   │   │   │   └── ClaimEventRepository.java
     │   │   │   │   ├── messaging/
     │   │   │   │   │   ├── ClaimEventPublisher.java      # interface          [W2]
-    │   │   │   │   │   └── LoggingClaimEventPublisher.java  # @Profile(test)  [W2]
+    │   │   │   │   │   ├── LoggingClaimEventPublisher.java  # @Profile(test)  [W2]
+    │   │   │   │   │   └── ClaimEventSqsConsumer.java    # long-poll consumer [W3]
     │   │   │   │   ├── outbox/                           # Transactional Outbox [W2]
     │   │   │   │   │   ├── OutboxEvent.java
     │   │   │   │   │   ├── OutboxStatus.java
@@ -176,7 +187,8 @@ claimsflow360/
     │   │   │   │   │   ├── ClaimSearchRepository.java    # interface
     │   │   │   │   │   ├── OpenSearchClaimSearchRepository.java  # @Profile(!test)
     │   │   │   │   │   ├── NoOpClaimSearchRepository.java        # @Profile(test)
-    │   │   │   │   │   └── ClaimProjectionService.java   # MySQL → OpenSearch
+    │   │   │   │   │   ├── ClaimProjectionService.java   # MySQL → OpenSearch
+    │   │   │   │   │   └── SearchReconciliationJob.java  # 6h drift repair    [W3]
     │   │   │   │   └── ai/                              # Bedrock            [W2]
     │   │   │   │       ├── ClaimsSummarizer.java         # interface
     │   │   │   │       ├── BedrockClaimsSummarizer.java  # @Profile(!test) Converse API
@@ -190,9 +202,21 @@ claimsflow360/
     │   │   │           ├── ClaimResponse.java
     │   │   │           ├── ClaimEventResponse.java
     │   │   │           └── AiSummaryResponse.java        #                   [W2]
+    │   │   ├── customer/                                # Customer360 BC     [W3]
+    │   │   │   ├── domain/Customer360View.java           # aggregated view record
+    │   │   │   ├── application/Customer360Service.java   # FR-05
+    │   │   │   └── api/Customer360Controller.java
+    │   │   ├── dashboard/                               # Real-time dashboard [W3]
+    │   │   │   ├── WebSocketConfig.java                  # STOMP /ws, /topic broker
+    │   │   │   ├── ClaimDashboardMetrics.java            # metrics record
+    │   │   │   ├── DashboardMetricsService.java          # FR-06
+    │   │   │   ├── DashboardBroadcaster.java             # push to /topic/metrics
+    │   │   │   ├── DashboardScheduler.java               # 10s heartbeat
+    │   │   │   └── DashboardController.java              # REST fallback
     │   │   └── shared/
     │   │       ├── config/
     │   │       │   ├── SecurityConfig.java
+    │   │       │   ├── SchedulingConfig.java             # central @EnableScheduling [W3]
     │   │       │   └── aws/                             #                    [W2]
     │   │       │       ├── SqsConfig.java               # @Profile(!test)
     │   │       │       ├── BedrockConfig.java           # @Profile(!test)
@@ -200,6 +224,7 @@ claimsflow360/
     │   │       └── exception/
     │   │           ├── DomainException.java
     │   │           ├── ClaimNotFoundException.java
+    │   │           ├── CustomerNotFoundException.java    #                   [W3]
     │   │           ├── InvalidClaimTransitionException.java
     │   │           ├── DuplicateClaimException.java
     │   │           └── GlobalExceptionHandler.java
@@ -224,10 +249,17 @@ claimsflow360/
         │           ├── outbox/
         │           │   ├── OutboxClaimEventPublisherTest.java  #             [W2]
         │           │   └── OutboxRelaySchedulerTest.java       #             [W2]
+        │           ├── messaging/
+        │           │   └── ClaimEventSqsConsumerTest.java      #             [W3]
         │           ├── search/
-        │           │   └── ClaimProjectionServiceTest.java     #             [W2]
+        │           │   ├── ClaimProjectionServiceTest.java     #             [W2]
+        │           │   └── SearchReconciliationJobTest.java    #             [W3]
         │           └── ai/
         │               └── BedrockClaimsSummarizerTest.java    #             [W2]
+        ├── java/com/claimsflow/customer/
+        │   └── application/Customer360ServiceTest.java  #                    [W3]
+        ├── java/com/claimsflow/dashboard/
+        │   └── DashboardMetricsServiceTest.java         #                    [W3]
         └── resources/application-test.yml               # H2 + all AWS beans disabled
 ```
 
@@ -365,6 +397,27 @@ curl -X POST http://localhost:8080/api/v1/claims/CLM-XXXX/project \
   -H "Authorization: Bearer <JWT>"
 ```
 
+### Week 3 endpoints
+
+```bash
+# Customer360 — aggregated policyholder view (MySQL-backed, strongly consistent)
+curl http://localhost:8080/api/v1/customers/POL-001/view \
+  -H "Authorization: Bearer <JWT>"
+
+# Dashboard metrics — REST fallback for the WebSocket stream
+curl http://localhost:8080/api/v1/dashboard/metrics \
+  -H "Authorization: Bearer <JWT>"
+```
+
+```javascript
+// WebSocket live metrics — STOMP client (e.g. @stomp/stompjs)
+const client = new StompJs.Client({ brokerURL: "ws://localhost:8080/ws" });
+client.onConnect = () =>
+  client.subscribe("/topic/metrics", msg => console.log(JSON.parse(msg.body)));
+client.activate();
+// Pushed on every consumed claim event + a 10s heartbeat
+```
+
 ---
 
 ## Interview Talking Points
@@ -383,3 +436,11 @@ curl -X POST http://localhost:8080/api/v1/claims/CLM-XXXX/project \
 7. **OpenSearch Query DSL — never string concat** — `MultiMatchQuery` + `BoolQuery` with `FieldValue` typed parameters is injection-safe and lets OpenSearch optimise the query plan. String concatenation breaks on special characters and is a security risk.
 8. **Bedrock Converse API vs InvokeModel** — Converse API is model-agnostic. Swapping Claude Haiku (cost) to Claude Sonnet (accuracy) is a one-line `model-id` config change. InvokeModel requires request/response format changes per model.
 9. **Why `temperature=0.2` for claim summarization?** — Low temperature produces deterministic, structured JSON output. High temperature is for creative tasks; for classification/extraction you want consistency.
+
+### Week 3
+
+10. **Why does the SQS consumer run on its own thread, not `@Scheduled`?** — A 10-second long poll inside a scheduled method blocks the shared TaskScheduler; with the default single-thread pool it would starve the outbox relay entirely. `SmartLifecycle` + a dedicated executor gives the consumer its own thread with clean startup/shutdown semantics.
+11. **Poison vs transient message handling** — Unparseable payloads and events for missing claims are *permanent* failures: delete them (DLQ in prod) or they block the FIFO message group forever. OpenSearch-down is *transient*: leave the message for visibility-timeout redelivery — the FIFO group blocks briefly, which is exactly what preserves per-claim ordering.
+12. **Why is Customer360 built from MySQL and not OpenSearch?** — Money totals shown to a policyholder must be strongly consistent; a 2-second-stale approved amount is a real complaint. A single policyholder has tens of claims — one indexed query — so the relational path is cheap. OpenSearch stays the engine for portfolio-wide search/analytics where staleness is acceptable.
+13. **Why does the reconciliation lookback (7 h) exceed the interval (6 h)?** — The overlap guarantees a claim updated moments before a sweep is still covered by the next one. Reconciliation over an idempotent upsert means over-projecting costs nothing; under-projecting is silent drift.
+14. **Why centralize `@EnableScheduling`?** — It was riding on `OutboxRelayScheduler`; deleting that one class would have silently disabled every other scheduled job. Cross-cutting switches belong in dedicated config, not on an arbitrary component.

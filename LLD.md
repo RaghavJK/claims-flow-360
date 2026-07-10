@@ -1,7 +1,7 @@
 # ClaimsFlow360 — Low-Level Design (LLD)
 
-**Document version:** 2.0  
-**Last updated:** 2026-05-09  
+**Document version:** 3.0  
+**Last updated:** 2026-07-10  
 **Author:** Raghavendra K Murthy — Senior Principal Architect  
 **Status:** Living document — updated at the end of each delivery week  
 
@@ -23,6 +23,7 @@
 12. [Exception Hierarchy](#12-exception-hierarchy)
 13. [Test Architecture](#13-test-architecture)
 14. [Configuration Reference](#14-configuration-reference)
+15. [Week 3 Components](#15-week-3-components)
 
 ---
 
@@ -1032,7 +1033,7 @@ GlobalExceptionHandler (@RestControllerAdvice)
 
 ## 13. Test Architecture
 
-### Test Coverage (Week 2: 37 tests)
+### Test Coverage (Week 3: 52 tests)
 
 | Test Class | Layer | What It Tests |
 |---|---|---|
@@ -1046,6 +1047,10 @@ GlobalExceptionHandler (@RestControllerAdvice)
 | `OutboxRelaySchedulerTest` | Infrastructure | No-op on empty, SQS send args, markSent/markFailed, retry reset |
 | `ClaimProjectionServiceTest` | Infrastructure | Document field mapping, fraud flag threshold, not-found throw |
 | `BedrockClaimsSummarizerTest` | Infrastructure | Converse API called with correct model + prompt content |
+| `ClaimEventSqsConsumerTest` | Infrastructure | Valid event → project + broadcast + delete; poison (bad JSON / missing claim) → deleted; transient failure → left for redelivery; empty receive no-op |
+| `SearchReconciliationJobTest` | Infrastructure | Sweep re-projects all changed claims; one failure doesn't abort; no-op when nothing changed |
+| `Customer360ServiceTest` | Application | Aggregation of counts/totals/fraud exposure; recent-claims cap; zero-division guards; unknown policy → 404 |
+| `DashboardMetricsServiceTest` | Application | Status counts, approval rate, null-safe average fraud score |
 
 ### Testing Principles
 
@@ -1108,3 +1113,99 @@ class AiSummarizationServiceTest {
 | `waitDurationInOpenState` | 30s | Bedrock recovers quickly | Bedrock is slow to recover |
 | `maxAttempts` | 3 | Too many retries under load | Bedrock transient errors |
 | `waitDuration` | 500ms (exp) | Reduce retry pressure | Bedrock needs more time |
+
+---
+
+## 15. Week 3 Components
+
+### `ClaimEventSqsConsumer` — closing the CQRS loop
+
+```
+ClaimEventSqsConsumer  (@Profile("!test"), implements SmartLifecycle)
+──────────────────────────────────────────
+- sqsClient            : SqsClient
+- claimRepository      : ClaimRepository
+- projectionService    : ClaimProjectionService
+- dashboardBroadcaster : DashboardBroadcaster
+- executor             : single-thread ExecutorService ("claim-event-sqs-consumer")
+──────────────────────────────────────────
+start()    → running=true; executor.submit(pollLoop)     [container-managed]
+stop()     → running=false; shutdownNow + 5s await       [graceful on context close]
+pollOnce() → receiveMessage(wait=10s, max=10) → handle() each  [unit-test entry point]
+
+handle(message) decision table:
+  valid payload + claim found   → project(claimRef) → broadcast() → deleteMessage
+  unparseable JSON              → POISON: deleteMessage + ERROR log (DLQ in prod)
+  no numeric claimId in payload → POISON: deleteMessage + ERROR log
+  claim not found by id         → POISON: deleteMessage (outbox commits after claim
+                                   insert, so missing claim = corruption, not a race)
+  RuntimeException (projection) → TRANSIENT: leave on queue; visibility-timeout
+                                   redelivery; FIFO group blocks = ordering preserved
+```
+
+**Threading rationale:** a 10 s long poll inside `@Scheduled` would monopolize the
+shared TaskScheduler (default pool = 1) and starve the outbox relay. See HLD ADR-008.
+
+**Idempotency:** projection is an upsert keyed by claimRef; duplicate delivery
+(relay retry, redelivery) re-writes the same document — safe by construction.
+
+### `SearchReconciliationJob` — drift repair
+
+```
+@Scheduled(fixedDelay = 21_600_000 ms /* 6h */, initialDelay = 60_000 ms)
+reconcile():
+  since = now - lookbackHours (7h — overlaps the 6h interval; no coverage gap)
+  for each claim in findByUpdatedAtAfter(since):
+      try project(claimRef)          ← idempotent upsert; over-projecting is free
+      catch RuntimeException → log + continue   ← one bad claim never aborts a sweep
+  log "N re-projected, M failed"
+```
+
+### Customer360 (FR-05)
+
+```
+Customer360Service.view(policyNumber)  [@Transactional(readOnly = true)]
+  claims = findByPolicyNumberOrderByCreatedAtDesc(policyNumber)   ← MySQL, indexed
+  empty → CustomerNotFoundException → 404 ProblemDetail
+  single in-memory pass accumulates:
+    claimsByStatus (EnumMap), totalAmountClaimed, totalAmountApproved (null-safe),
+    fraudFlaggedCount (score >= threshold), averageFraudScore (scored claims only),
+    first/lastClaimAt, recentClaims (top 5, newest first)
+```
+
+Money aggregates read the write model deliberately — HLD ADR-009. Per-policyholder
+volume is tens of rows; in-memory aggregation beats pushing GROUP BY to SQL here.
+
+### Real-Time Dashboard (FR-06)
+
+```
+Topology:
+  client ──STOMP──► /ws (handshake, permitAll — W4: JWT on CONNECT)
+         subscribe /topic/metrics
+
+Broadcast triggers (both funnel through DashboardBroadcaster):
+  1. ClaimEventSqsConsumer — after every processed event   (near-real-time)
+  2. DashboardScheduler    — 10 s heartbeat                (convergence w/o events)
+
+DashboardBroadcaster.broadcast():
+  snapshot() → SimpMessagingTemplate.convertAndSend("/topic/metrics", metrics)
+  catch RuntimeException → WARN + swallow   ← losing a frame is harmless;
+                                              breaking event processing is not
+
+ClaimDashboardMetrics record:
+  totalClaims, submitted, underReview, adjudication, approved, denied,
+  approvalRate = approved/(approved+denied) [0 if no terminal claims],
+  fraudFlaggedCount, averageFraudScore [0 when SQL avg returns NULL], generatedAt
+```
+
+### Week 3 Configuration Additions
+
+| Property | Default | Description |
+|---|---|---|
+| `spring.task.scheduling.pool.size` | `4` | Relay + retry + reconciliation + heartbeat never serialize |
+| `claimsflow.aws.sqs.consumer.wait-time-seconds` | `10` | SQS long-poll wait (max 20) |
+| `claimsflow.aws.sqs.consumer.max-messages` | `10` | Batch size per receive (SQS max) |
+| `claimsflow.reconciliation.interval-ms` | `21600000` | 6 h between drift-repair sweeps |
+| `claimsflow.reconciliation.initial-delay-ms` | `60000` | Warm-up before first sweep |
+| `claimsflow.reconciliation.lookback-hours` | `7` | Overlaps interval — no coverage gap |
+| `claimsflow.dashboard.broadcast-interval-ms` | `10000` | WebSocket metrics heartbeat |

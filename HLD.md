@@ -1,7 +1,7 @@
 # ClaimsFlow360 — High-Level Design (HLD)
 
-**Document version:** 2.0  
-**Last updated:** 2026-05-09  
+**Document version:** 3.0  
+**Last updated:** 2026-07-10  
 **Author:** Raghavendra K Murthy — Senior Principal Architect  
 **Status:** Living document — updated at the end of each delivery week  
 
@@ -153,9 +153,9 @@
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
-### Customer Bounded Context (Week 3 — planned)
+### Customer Bounded Context (implemented — Week 3)
 
-Aggregated policyholder view: lifetime claim count, open/closed by year, fraud flag rate, coverage utilization. Backed by OpenSearch faceted aggregations.
+Aggregated policyholder view (`Customer360View`): claim counts by status, financial totals, fraud exposure, recent activity. Reads the Claims context only through its repository port. Financial aggregates deliberately come from MySQL, not OpenSearch — see ADR-009.
 
 ### Documents Bounded Context (Week 4 — planned)
 
@@ -202,10 +202,13 @@ OutboxRelayScheduler.relay()
   ├─► SqsClient.sendMessage(FIFO, groupId=claimRef, dedupeId=outboxId)
   └─► OutboxEvent.markSent()
 
-  (SQS consumer — Week 3)
-  @SqsListener
-  └─► ClaimProjectionService.project(claimRef)
-       └─► OpenSearch upsert (ClaimDocument)
+  (SQS consumer — implemented Week 3)
+ClaimEventSqsConsumer (long-poll, dedicated thread)
+  ├─► resolve claim by claimId from payload
+  ├─► ClaimProjectionService.project(claimRef)
+  │    └─► OpenSearch upsert (ClaimDocument)
+  ├─► DashboardBroadcaster.broadcast() → /topic/metrics
+  └─► deleteMessage (poison msgs deleted; transient failures redelivered)
 ```
 
 ### Flow 2 — AI Summarization
@@ -500,6 +503,28 @@ Zero real AWS. Zero Docker. All 37 tests green.
 
 ---
 
+### ADR-008: SQS Consumer on a Dedicated Lifecycle Thread (Week 3)
+
+**Status:** Accepted  
+**Context:** The consumer long-polls SQS (10 s wait). All `@Scheduled` methods share Spring's TaskScheduler — default pool size 1 — so a blocking long poll inside a scheduled method starves the outbox relay and every other job.  
+**Decision:** `ClaimEventSqsConsumer` implements `SmartLifecycle` and runs a continuous poll loop on its own single-thread `ExecutorService`. Scheduler pool additionally sized to 4 (`spring.task.scheduling.pool.size`) for the remaining jobs.  
+**Alternatives rejected:**
+- **`@Scheduled` short poll (waitTimeSeconds=0)**: eliminates blocking but forfeits long-poll economics — vastly more empty receives, higher SQS cost.
+- **Spring Cloud AWS `@SqsListener`**: idiomatic, but adds a dependency and an async client for a single queue; the raw SDK loop is consistent with existing SqsClient usage and directly unit-testable.  
+**Consequences:** Clean container-managed startup/shutdown; consumer failure modes isolated from scheduled jobs. Multi-instance deployment naturally shares work via SQS visibility semantics.
+
+---
+
+### ADR-009: Customer360 Reads from MySQL, Not OpenSearch (Week 3)
+
+**Status:** Accepted  
+**Context:** FR-05 shows a policyholder their financial totals (claimed, approved). The OpenSearch read model lags writes by up to ~2 s.  
+**Decision:** Aggregate the Customer360 view from the MySQL write model — one indexed query per policyholder (tens of rows), in-memory aggregation.  
+**Rationale:** Money shown to its owner must be strongly consistent; a stale approved amount is a support call, not "eventual consistency." Store selection is per-query by consistency requirement, not per architecture layer.  
+**Consequences:** OpenSearch remains the engine for portfolio-wide search/analytics. If policyholder claim counts ever grow large, revisit with a MySQL read replica — not the search index.
+
+---
+
 ## 10. Security Model
 
 ```
@@ -558,7 +583,7 @@ OpenSearch                 Eventual consistency model       Empty ClaimSearchRes
 |---|---|---|---|
 | Week 1 | Core Domain + REST API | FR-01 (partial), FR-02, FR-04 (partial) | ✅ Done |
 | Week 2 | Outbox + SQS + OpenSearch CQRS + Bedrock | FR-01, FR-03, FR-04 (full) | ✅ Done |
-| Week 3 | SQS Consumer + Customer360 + WebSocket | FR-05, FR-06 | 🔜 Planned |
+| Week 3 | SQS Consumer + Reconciliation + Customer360 + WebSocket | FR-05, FR-06 | ✅ Done |
 | Week 4 | Documents + Notifications + Security | FR-07, FR-08, Security hardening | 🔜 Planned |
 
 ### Feature Requirements Matrix
@@ -569,7 +594,7 @@ OpenSearch                 Eventual consistency model       Empty ClaimSearchRes
 | FR-02 | Workflow State Machine | ✅ Full | `WorkflowService`, `ClaimStatus.ALLOWED` |
 | FR-03 | AI Summarization | ✅ Full | `AiSummarizationService`, `BedrockClaimsSummarizer` |
 | FR-04 | Fraud Detection | ✅ 3 indicators | `FraudScoringChain` + 3 `FraudIndicator` beans |
-| FR-05 | Customer360 | 🔜 Week 3 | — |
-| FR-06 | Real-Time Dashboard | 🔜 Week 3 | WebSocket endpoint planned |
+| FR-05 | Customer360 | ✅ Full | `Customer360Service`, `GET /customers/{policyNumber}/view` |
+| FR-06 | Real-Time Dashboard | ✅ Full | `DashboardMetricsService`, STOMP `/ws` + `/topic/metrics` |
 | FR-07 | Document Management | 🔜 Week 4 | S3 + Textract |
 | FR-08 | Notifications | 🔜 Week 4 | SNS + SQS DLQ |
