@@ -1,7 +1,7 @@
 # ClaimsFlow360 — Low-Level Design (LLD)
 
-**Document version:** 3.0  
-**Last updated:** 2026-07-10  
+**Document version:** 4.0  
+**Last updated:** 2026-07-12  
 **Author:** Raghavendra K Murthy — Senior Principal Architect  
 **Status:** Living document — updated at the end of each delivery week  
 
@@ -24,6 +24,7 @@
 13. [Test Architecture](#13-test-architecture)
 14. [Configuration Reference](#14-configuration-reference)
 15. [Week 3 Components](#15-week-3-components)
+16. [Week 4 Components](#16-week-4-components)
 
 ---
 
@@ -1033,7 +1034,7 @@ GlobalExceptionHandler (@RestControllerAdvice)
 
 ## 13. Test Architecture
 
-### Test Coverage (Week 3: 52 tests)
+### Test Coverage (Week 4: 74 tests)
 
 | Test Class | Layer | What It Tests |
 |---|---|---|
@@ -1051,6 +1052,11 @@ GlobalExceptionHandler (@RestControllerAdvice)
 | `SearchReconciliationJobTest` | Infrastructure | Sweep re-projects all changed claims; one failure doesn't abort; no-op when nothing changed |
 | `Customer360ServiceTest` | Application | Aggregation of counts/totals/fraud exposure; recent-claims cap; zero-division guards; unknown policy → 404 |
 | `DashboardMetricsServiceTest` | Application | Status counts, approval rate, null-safe average fraud score |
+| `AesGcmStringCryptoConverterTest` | Shared/security | Roundtrip, IV uniqueness (same plaintext ≠ same ciphertext), null passthrough, wrong-key rejection, key-length validation |
+| `DocumentServiceTest` | Application | Register + presigned URL + key sanitization; confirm; OCR success/failure paths; not-found |
+| `NotificationServiceTest` | Application | Per-channel fanout on status change; approved amount in body |
+| `NotificationDispatcherTest` | Application | Send→SENT; failure→retry; exhausted→DEAD; batch isolation; empty no-op |
+| `JwtStompChannelInterceptorTest` | Dashboard | Valid token authenticates CONNECT; missing/invalid rejected; non-CONNECT frames pass through |
 
 ### Testing Principles
 
@@ -1209,3 +1215,103 @@ ClaimDashboardMetrics record:
 | `claimsflow.reconciliation.initial-delay-ms` | `60000` | Warm-up before first sweep |
 | `claimsflow.reconciliation.lookback-hours` | `7` | Overlaps interval — no coverage gap |
 | `claimsflow.dashboard.broadcast-interval-ms` | `10000` | WebSocket metrics heartbeat |
+
+---
+
+## 16. Week 4 Components
+
+### Documents Bounded Context (FR-07)
+
+```
+Upload protocol (bytes never transit the API tier):
+  1. POST /api/v1/claims/{ref}/documents          → ClaimAttachment(PENDING_UPLOAD)
+                                                     + presigned S3 PUT URL (15 min)
+  2. client → HTTP PUT file to uploadUrl           (direct to S3)
+  3. POST /api/v1/documents/{id}/confirm           → UPLOADED
+  4. POST /api/v1/documents/{id}/ocr               → OCR_COMPLETE | OCR_FAILED
+
+ClaimAttachment (claim_documents, Flyway V4)
+  s3Key = claims/{claimRef}/{uuid}-{sanitizedFileName}   (UNIQUE)
+  status: PENDING_UPLOAD → UPLOADED → OCR_COMPLETE | OCR_FAILED (re-triggerable)
+
+Ports:
+  DocumentStorage.presignUpload(key, contentType)
+    S3DocumentStorage (!test)   — S3Presigner.presignPutObject
+    StubDocumentStorage (test)  — deterministic fake URL
+  OcrEngine.extractText(key)
+    TextractOcrEngine (!test)   — sync DetectDocumentText, joins LINE blocks
+                                  (async StartDocumentTextDetection = multi-page upgrade path)
+    StubOcrEngine (test)
+
+Failure stance: OCR failure marks OCR_FAILED and returns 200 — extraction is
+enrichment, not a gate (same philosophy as the Bedrock fallback).
+```
+
+### Notification Engine (FR-08)
+
+```
+Trigger: WorkflowService.transition() → NotificationService.claimStatusChanged()
+         rows commit WITH the transition (outbox principle — no dual-write gap)
+
+Notification (notifications, Flyway V5)
+  one row per channel: EMAIL, SMS, IN_APP
+  status: PENDING → SENT
+                  → FAILED (retryCount++) → … → DEAD at maxRetries=3
+
+NotificationDispatcher  @Scheduled(5s)  @Transactional
+  batch = findByStatusIn([PENDING, FAILED], limit 50)   ← DEAD never re-picked
+  per row: sender.send() → markSent() | markFailed(maxRetries)
+  one failure never aborts the batch
+
+NotificationSender port:
+  SnsNotificationSender (!test) — one topic, message attributes
+    {channel, recipient, claimRef}; channel subscribers (SES/SMS/in-app
+    bridge) filter on the channel attribute — SNS does the fanout
+  LoggingNotificationSender (test)
+
+DEAD = in-table dead-letter (HLD ADR-011): same semantics as an SQS DLQ,
+queryable via SQL for a support dashboard.
+```
+
+### PII Field Encryption
+
+```
+AesGcmStringCryptoConverter (JPA @Converter, Spring bean via SpringBeanContainer)
+  AES/GCM/NoPadding, 256-bit key, TAG=128 bits
+  encrypt: iv = random 12 bytes → base64(iv ‖ ciphertext+tag)
+  decrypt: auth-tag mismatch → IllegalStateException (never garbage plaintext)
+  key: claimsflow.security.field-encryption-key (base64 32B; Secrets Manager in prod)
+
+Applied to: claims.claimant_ssn VARCHAR(512) (Flyway V6)
+  optional at ingestion (CreateClaimRequest.ssn, @Pattern-validated)
+  NEVER serialized into ClaimResponse, ClaimDocument (OpenSearch), or logs
+  random IV ⇒ no equality search by design; lookup-by-SSN would need a
+  keyed-HMAC blind-index column (HLD ADR-012)
+```
+
+### WebSocket CONNECT Auth
+
+```
+JwtStompChannelInterceptor implements ChannelInterceptor
+  preSend: only StompCommand.CONNECT is inspected
+    Authorization native header → "Bearer <jwt>" → jwtDecoder.decode()
+    valid   → accessor.setUser(sub)  — session authenticated
+    missing/invalid → BadCredentialsException — CONNECT rejected,
+                      no subscription possible
+
+Why not the handshake? Browsers cannot set headers on the WS upgrade request.
+/ws/** stays permitAll at the HTTP layer; the STOMP frame carries the token.
+Same JwtDecoder as the REST API — one token, both transports.
+```
+
+### Week 4 Configuration Additions
+
+| Property | Default | Description |
+|---|---|---|
+| `claimsflow.aws.s3.documents-bucket` | `claimsflow-documents-dev` | Document storage bucket |
+| `claimsflow.aws.s3.presign-expiry-minutes` | `15` | Presigned PUT URL lifetime |
+| `claimsflow.aws.sns.notifications-topic-arn` | — | Notification fanout topic |
+| `claimsflow.notifications.dispatch-interval-ms` | `5000` | Dispatcher cadence |
+| `claimsflow.notifications.max-retries` | `3` | Attempts before DEAD |
+| `claimsflow.notifications.batch-size` | `50` | Rows per dispatch cycle |
+| `claimsflow.security.field-encryption-key` | dev key | base64 32-byte AES key (Secrets Manager in prod) |

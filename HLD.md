@@ -1,7 +1,7 @@
 # ClaimsFlow360 — High-Level Design (HLD)
 
-**Document version:** 3.0  
-**Last updated:** 2026-07-10  
+**Document version:** 4.0  
+**Last updated:** 2026-07-12  
 **Author:** Raghavendra K Murthy — Senior Principal Architect  
 **Status:** Living document — updated at the end of each delivery week  
 
@@ -525,6 +525,34 @@ Zero real AWS. Zero Docker. All 37 tests green.
 
 ---
 
+### ADR-010: Presigned Direct-to-S3 Upload (Week 4)
+
+**Status:** Accepted  
+**Context:** FR-07 requires document upload (photos, PDFs up to tens of MB). Proxying uploads through the API ties up servlet threads, heap, and bandwidth per transfer.  
+**Decision:** Register-then-upload protocol: the API creates metadata and returns a presigned S3 PUT URL (single key, single content type, 15-minute expiry); the client uploads directly to S3 and confirms.  
+**Consequences:** API tier stays stateless and cheap regardless of file size. Trade-off: the "confirm" step is client-driven — a client that uploads but never confirms leaves a PENDING_UPLOAD row (future S3 event notification closes that gap).
+
+---
+
+### ADR-011: In-Table Dead-Letter for Notifications (Week 4)
+
+**Status:** Accepted  
+**Context:** FR-08 calls for retry + DLQ semantics on notification delivery.  
+**Decision:** Notification rows are written inside the claim-transition transaction (outbox principle); a scheduled dispatcher delivers via SNS with max-3 retries, then marks the row `DEAD` — an in-table dead-letter.  
+**Alternatives rejected:** A real SQS DLQ presumes delivery happens off a queue consumer; here delivery state already lives in MySQL, and `status=DEAD` gives identical semantics (isolate poison, keep evidence, manual replay) plus free SQL queryability for a support dashboard.  
+**Consequences:** Revisit when notification volume justifies a dedicated queue pipeline; the `NotificationSender` port keeps that migration local.
+
+---
+
+### ADR-012: AES-256-GCM with Random IV for PII Fields (Week 4)
+
+**Status:** Accepted  
+**Context:** Compliance requires SSN/DOB encrypted at rest, beyond disk-level encryption.  
+**Decision:** JPA `AttributeConverter` applying AES-256-GCM with a fresh random IV per write; ciphertext stored as `base64(iv‖ciphertext‖tag)`. Key from configuration (AWS Secrets Manager in prod).  
+**Consequences:** Authenticated encryption — tampering fails loudly on decrypt. Identical plaintexts yield different ciphertexts, so equality search on the column is impossible **by design**; if lookup-by-SSN is ever required, add a keyed-HMAC blind-index column rather than weakening to deterministic encryption.
+
+---
+
 ## 10. Security Model
 
 ```
@@ -533,9 +561,10 @@ Zero real AWS. Zero Docker. All 37 tests green.
 ├────────────────────────────────────────────────────────────────────────┤
 │  Transport        HTTPS / TLS 1.3 (ALB terminates in prod)              │
 │  Authentication   JWT (HS256 local dev / RS256 Cognito in prod)         │
+│                   WebSocket: JWT enforced on STOMP CONNECT frame [W4]   │
 │  Authorization    Spring Security 6 OAuth2 Resource Server              │
-│                   RBAC roles: ROLE_ADJUSTER, ROLE_ADMIN (Week 4)        │
-│  PII Protection   AES-256 field-level encryption for SSN/DOB (Week 4)   │
+│                   RBAC roles: ROLE_ADJUSTER, ROLE_ADMIN (deferred)      │
+│  PII Protection   AES-256-GCM field encryption, random IV — SSN [W4]    │
 │  Audit            Immutable claim_events — all state changes recorded   │
 │  Secrets          AWS Secrets Manager in prod (not env vars)            │
 └────────────────────────────────────────────────────────────────────────┘
@@ -584,7 +613,7 @@ OpenSearch                 Eventual consistency model       Empty ClaimSearchRes
 | Week 1 | Core Domain + REST API | FR-01 (partial), FR-02, FR-04 (partial) | ✅ Done |
 | Week 2 | Outbox + SQS + OpenSearch CQRS + Bedrock | FR-01, FR-03, FR-04 (full) | ✅ Done |
 | Week 3 | SQS Consumer + Reconciliation + Customer360 + WebSocket | FR-05, FR-06 | ✅ Done |
-| Week 4 | Documents + Notifications + Security | FR-07, FR-08, Security hardening | 🔜 Planned |
+| Week 4 | Documents + Notifications + PII Encryption + WS Auth + CI | FR-07, FR-08, Security hardening | ✅ Done |
 
 ### Feature Requirements Matrix
 
@@ -596,5 +625,5 @@ OpenSearch                 Eventual consistency model       Empty ClaimSearchRes
 | FR-04 | Fraud Detection | ✅ 3 indicators | `FraudScoringChain` + 3 `FraudIndicator` beans |
 | FR-05 | Customer360 | ✅ Full | `Customer360Service`, `GET /customers/{policyNumber}/view` |
 | FR-06 | Real-Time Dashboard | ✅ Full | `DashboardMetricsService`, STOMP `/ws` + `/topic/metrics` |
-| FR-07 | Document Management | 🔜 Week 4 | S3 + Textract |
-| FR-08 | Notifications | 🔜 Week 4 | SNS + SQS DLQ |
+| FR-07 | Document Management | ✅ Full | `DocumentService`, presigned S3 upload + Textract OCR |
+| FR-08 | Notifications | ✅ Full | `NotificationService` + `NotificationDispatcher`, SNS fanout, in-table DLQ |

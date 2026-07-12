@@ -763,27 +763,172 @@ The two longer posts above go deep on the *how*. This one is for anyone who want
 
 ---
 
-## Post Template — Coming Weeks
+## Week 4 — Files That Never Touch Your API, Notifications That Never Lose a Message, and Encryption That Refuses to Lie
 
-The following is a pre-planned story arc for upcoming weekly posts. Fill in the details after each week's delivery.
+### *Presigned S3 uploads, an in-table dead-letter queue, AES-GCM done properly, STOMP frame auth — and the 404 that was silently a 500*
 
 ---
 
-### Week 4 (Draft) — Documents, Notifications, and Security Hardening
+Week 3 closed the CQRS loop. Week 4 made ClaimsFlow360 handle the messy parts of real insurance: documents, notifications, and PII. Plus the security hardening I'd been deferring and a CI pipeline to keep me honest.
 
-**Story hook:** Claims don't arrive as JSON payloads in real life — they come with photos, PDFs, and hospital reports. This week I wire S3 document upload + Amazon Textract OCR, build an SNS multi-channel notification engine, and add AES-256 field-level encryption for PII fields.
+Five deliverables:
 
-**Technical themes to cover:**
-- S3 presigned URL upload flow (client uploads directly, bypasses the API)
-- Amazon Textract async job → SNS callback → structured data extraction
-- SNS fanout → email, SMS, in-app channels; SQS DLQ for failed delivery retries
-- AES-256 field-level encryption for `ssn` and `dob` fields (JPA `@Converter`)
-- JWT auth on the WebSocket CONNECT frame (closing the Week 3 `/ws/**` permitAll)
-- GitLab CI pipeline: build → test → JaCoCo coverage gate → Docker image → EB deploy
-- Spring Security RBAC: `ROLE_ADJUSTER` (read + transition), `ROLE_ADMIN` (full access including denial)
-- AWS Cognito: replacing the HS256 dev JWT with real OAuth2 issuer-uri
-- Testcontainers: MySQL + LocalStack integration tests (carried from Week 3, pending Docker fix)
+1. **Documents bounded context** — S3 presigned upload + Textract OCR (FR-07)
+2. **Notification engine** — SNS multi-channel fanout with retry and dead-letter (FR-08)
+3. **AES-256-GCM field encryption** for claimant SSN
+4. **JWT on the WebSocket CONNECT frame** — closing last week's deliberate gap
+5. **GitHub Actions CI** with a JaCoCo coverage gate
 
+---
+
+### Documents: The Upload That Never Touches Your API
+
+Claims come with evidence — accident photos, hospital reports, repair estimates. The naive design accepts a multipart POST and streams the file through the application to S3. That design costs you a servlet thread, heap, and double bandwidth *per upload*, and it scales exactly as badly as it sounds.
+
+The production pattern is **presigned direct-to-S3 upload**:
+
+```
+1. POST /claims/{ref}/documents        → metadata row + presigned S3 PUT URL
+2. Client HTTP PUTs the file to S3     → bytes never touch the API tier
+3. POST /documents/{id}/confirm        → PENDING_UPLOAD → UPLOADED
+4. POST /documents/{id}/ocr            → Textract → OCR_COMPLETE
+```
+
+The presigned URL *is* the credential — scoped to one S3 key, one content type, 15 minutes. The API hands out a capability, not a proxy.
+
+One deliberate failure-handling choice: **OCR failure is not an error response.** Textract throttled? The attachment goes to `OCR_FAILED` — a re-triggerable state — and the endpoint returns 200 with that status. Text extraction is *enrichment*; a claim is never blocked because a photo wouldn't OCR. It's the same fail-safe stance as the Week 2 Bedrock fallback, and by now it's a design principle of the platform: **AI and extraction augment the workflow; they never gate it.**
+
+---
+
+### Notifications: The Outbox Principle, Applied Again
+
+When a claim moves from `ADJUDICATION` to `APPROVED`, the claimant should hear about it — email, SMS, in-app. The interesting question is the same one from Week 2: *how do you guarantee the notification isn't lost?*
+
+If `WorkflowService` called SNS directly after committing, an SNS outage would mean approved claims with no notification — silently. If it called SNS *before* committing, a rollback would mean notifications for transitions that never happened.
+
+Sound familiar? It's the dual-write problem again, and the answer is the same shape:
+
+```java
+@Transactional
+public Claim transition(String claimRef, ClaimStatus target, ...) {
+    ClaimStatus from = claim.transitionTo(target);
+    claimEventRepository.save(...);
+    eventPublisher.publish(event);                       // outbox row
+    notificationService.claimStatusChanged(claim, from, target);  // notification rows
+    return claim;   // ← ONE commit: transition + events + notifications
+}
+```
+
+Notification rows commit atomically with the transition. A scheduled dispatcher delivers them every 5 seconds through a `NotificationSender` port — SNS in production, a logging stub in tests.
+
+**The retry and dead-letter policy:**
+
+| Attempt | Outcome |
+|---|---|
+| Delivery succeeds | `SENT` |
+| Fails, attempts < 3 | `FAILED` — picked up again next cycle |
+| Fails, attempt 3 | `DEAD` — never retried, kept as evidence |
+
+I used an **in-table dead-letter** (`status=DEAD`) instead of an SQS DLQ, and I'd defend that choice: the dispatcher already owns delivery state in MySQL, `DEAD` gives identical semantics (isolate poison, keep evidence, manual replay), and — the part an SQS DLQ can't do — a support engineer can find every dead notification with a WHERE clause. A real DLQ earns its place when delivery moves to a queue consumer. Architecture is choosing the *simplest mechanism that gives the required semantics*, not the most familiar acronym.
+
+On the SNS side, one topic does all three channels: subscribers filter on a `channel` message attribute (`EMAIL`, `SMS`, `IN_APP`). Fanout is SNS's job, not application code.
+
+---
+
+### AES-256-GCM: Encryption That Refuses to Lie
+
+Field-level PII encryption is one of those requirements where the naive version and the correct version look almost identical — and the differences are exactly what an auditor (or attacker) cares about.
+
+The implementation is a JPA `AttributeConverter` (Spring Boot 3 registers Hibernate's `SpringBeanContainer`, so the converter is a real Spring bean and the key arrives by constructor injection — no static-holder hacks):
+
+```java
+@Convert(converter = AesGcmStringCryptoConverter.class)
+@Column(name = "claimant_ssn", length = 512)
+private String claimantSsn;
+```
+
+Three properties worth spelling out:
+
+**1. GCM, not CBC.** GCM is *authenticated* encryption — the ciphertext carries a tag that decryption verifies. Tampered or wrong-key data throws; it never returns garbage that looks like an SSN. My test suite proves it: decrypting with the wrong key must throw `IllegalStateException`, not produce output.
+
+**2. Random IV per write.** Two claimants with the same SSN produce completely different ciphertexts. The column leaks *nothing* — not even equality. The layout is `base64(iv ‖ ciphertext ‖ tag)`, IV prepended, self-contained per row.
+
+**3. The cost is deliberate.** Random IVs mean `WHERE claimant_ssn = ?` can never work. That's not a limitation to work around — it's the security property. If the business ever needs lookup-by-SSN, the answer is a separate keyed-HMAC *blind index* column, never downgrading to deterministic encryption.
+
+And the boring-but-critical parts: the SSN is `@Pattern`-validated on input, never serialized into any response DTO, never projected to OpenSearch, never logged. Encryption at rest means nothing if the plaintext leaks out the sides.
+
+---
+
+### WebSocket Auth: Why You Can't Just Protect the Handshake
+
+Last week I left `/ws/**` as `permitAll` with a note saying "Week 4 hardening item." Here's why the fix isn't what most people expect.
+
+The instinct is to require the JWT on the WebSocket handshake like any other HTTP request. The problem: **browsers cannot set an `Authorization` header on a WebSocket upgrade request.** The `WebSocket` API simply has no parameter for it. Cookie auth works, query-string tokens leak into logs — the standard answer for token-based auth is:
+
+1. Leave the HTTP handshake open.
+2. Require the bearer token as a **STOMP native header on the CONNECT frame**.
+3. Validate it in a `ChannelInterceptor` before the session exists.
+
+```java
+public Message<?> preSend(Message<?> message, MessageChannel channel) {
+    if (accessor.getCommand() != StompCommand.CONNECT) return message;
+
+    Jwt jwt = jwtDecoder.decode(bearerToken(accessor));   // same decoder as REST
+    accessor.setUser(new UsernamePasswordAuthenticationToken(jwt.getSubject(), ...));
+    return message;
+}
+```
+
+No valid CONNECT, no session, no subscriptions — the interceptor rejects before the broker ever sees the client. And it reuses the exact `JwtDecoder` bean the REST API uses: one token, both transports, swap in Cognito later and both are upgraded together.
+
+---
+
+### The Bug: The 404 That Was Silently a 500
+
+Every not-found exception in the system maps to a clean RFC-7807 `404` via the `@RestControllerAdvice`. So when I added `DocumentNotFoundException`, extended `DomainException`, threw it from `DocumentService`... done, right?
+
+No. While updating the architecture docs, I re-read `GlobalExceptionHandler` and realized: **there was no `@ExceptionHandler` for it.** Each not-found type had its own explicit handler — `ClaimNotFoundException`, `CustomerNotFoundException` — and my new exception matched none of them. It fell through to the catch-all `Exception` handler: HTTP 500, "unexpected server error," for what was a routine wrong-ID request.
+
+Two lessons. The small one: I added the missing handler. The structural one: per-type handlers for identical behavior is a repetition trap — every new not-found exception re-creates this bug. The refactor (queued for the next pass) is one handler for a `NotFoundDomainException` base class, so the type system enforces what my memory didn't.
+
+Also worth noting *where* the bug was caught: not by tests (unit tests exercise the service, not the advice), not by compilation — by **writing documentation**. Explaining the exception table forced me to verify it. Docs-as-review is real.
+
+---
+
+### CI: The Pivot Nobody Notices Until It Bites
+
+The original plan said GitLab CI. The repository lives on GitHub. That plan was written before the repo existed — carrying it forward unexamined would have meant mirroring repos or wiring external runners for zero benefit.
+
+So: GitHub Actions. Checkout, Temurin 21 with Maven cache, `mvn -B clean verify`, upload the JaCoCo report as an artifact. And a coverage **gate**, not just a report:
+
+```xml
+<limit>
+    <counter>INSTRUCTION</counter>
+    <value>COVEREDRATIO</value>
+    <minimum>0.40</minimum>
+</limit>
+```
+
+Why a modest 40%? Because the honest number beats the aspirational one. The AWS adapter classes (S3 presigner, Textract, SNS, OpenSearch transport) are exercised only by the integration tests still blocked on Docker Desktop. A gate you set above your current floor gets `skip`-flagged within a month — set it at the floor, make it *impossible to regress*, and ratchet it up when the Testcontainers suite lands. A coverage gate is a ratchet, not a trophy.
+
+---
+
+### Week 4 Scoreboard
+
+- **74 tests** (up from 52) — converter roundtrip and wrong-key rejection, document lifecycle, notification retry/dead-letter, STOMP CONNECT auth. Still zero real AWS, zero Docker.
+- All 8 functional requirements from the original spec are now implemented: FR-01 through FR-08. ✅
+- Six Flyway migrations, four bounded contexts, three AWS SDK clients added this week (S3, Textract, SNS) — every one behind a port with a test-profile stub.
+- CI runs on every push with a coverage gate.
+
+**What's deliberately left:** Testcontainers integration tests (Docker Desktop still needs that admin install), RBAC roles, Cognito issuer swap, `policies`/`customers` tables. That's the hardening backlog, not missing features.
+
+Four weeks: from empty directory to a claims platform with CQRS, a transactional outbox, AI summarization, fraud scoring, full-text search, live dashboards, document OCR, guaranteed notifications, and encrypted PII — every pattern earning its place, every test green without touching a cloud.
+
+---
+
+**Tags:** `#AWS` `#S3` `#Textract` `#SNS` `#SpringBoot` `#Java21` `#Encryption` `#AESGCM` `#WebSocket` `#STOMP` `#GitHubActions` `#JaCoCo` `#CICD` `#InsuranceTech` `#BFSI` `#SoftwareArchitecture` `#SecurityEngineering`
+
+---
 ---
 
 *This document is updated at the end of each delivery week. Star the repository to follow the build.*

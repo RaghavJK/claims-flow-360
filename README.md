@@ -123,15 +123,22 @@ Anti-Corruption Layer protects the core domain from external data models.
 
 **Deferred:** Testcontainers MySQL + LocalStack integration tests (blocked on Docker Desktop install)
 
-### 🔜 Week 4 — Documents + Notifications + Security hardening
+### ✅ Week 4 — Documents + Notifications + PII Encryption + WS Auth + CI (commit `498a095`)
 
-- S3 document upload + Textract OCR integration (FR-07)
-- SNS multi-channel notification engine with SQS DLQ retries (FR-08)
-- AES-256 field-level encryption for SSN/DOB
-- JWT auth on WebSocket CONNECT frames (currently `/ws/**` is permitAll — read-only metrics)
-- Flyway migrations for remaining tables: `policies`, `customers`, `claim_documents`
-- GitLab CI pipeline + JaCoCo coverage gate
-- Testcontainers MySQL + LocalStack integration tests (carried over; requires Docker Desktop)
+| Area | Delivered |
+|---|---|
+| **Documents BC (FR-07)** | New `document` bounded context: `ClaimAttachment` entity (`claim_documents`, Flyway V4). Presigned-PUT protocol — register → client PUTs directly to S3 → confirm → OCR. **File bytes never transit the API tier** |
+| **OCR** | `OcrEngine` port → Textract `DetectDocumentText` (real) / stub (test). OCR failure marks `OCR_FAILED` (re-triggerable), never a 500 — extraction is enrichment, not a gate |
+| **Notification engine (FR-08)** | `Notification` rows (Flyway V5) written **inside the WorkflowService transaction** (outbox principle); scheduled dispatcher delivers via `NotificationSender` port → SNS topic fanout with `channel` message attributes (EMAIL/SMS/IN_APP subscribers filter) |
+| **Retry + dead-letter** | Delivery failure increments `retryCount`; at 3 attempts the row is dead-lettered (`DEAD` status — in-table DLQ, queryable for a support dashboard). One failure never blocks the batch |
+| **PII encryption** | `AesGcmStringCryptoConverter` — AES-256-GCM JPA converter, random IV per write (`base64(iv‖ciphertext‖tag)`). Optional claimant SSN (Flyway V6) encrypted at rest, **never** in responses or logs. Key from config; Secrets Manager in prod |
+| **WebSocket auth** | `JwtStompChannelInterceptor` validates the bearer token on the **STOMP CONNECT frame** (same `JwtDecoder` as REST). Handshake stays open — browsers can't set headers on the WS upgrade — closing the Week 3 gap the right way |
+| **CI** | GitHub Actions (`.github/workflows/ci.yml`) — repo hosts on GitHub, superseding the GitLab CI note. `mvn verify` + JaCoCo **40% instruction-coverage gate** (ratchets up when integration tests land) + coverage artifact upload |
+| **Tests** | 74 passing (+22 new) — converter roundtrip/IV-uniqueness/wrong-key rejection, document lifecycle + OCR failure, notification fanout/retry/dead-letter, STOMP CONNECT auth. Zero AWS, zero Docker |
+
+**Week 4 patterns added:** Presigned direct-to-storage upload · Ports & adapters for S3/Textract/SNS · Outbox-principle notifications · In-table dead-letter · Envelope-free field encryption (AES-GCM + random IV) · STOMP frame-level auth
+
+**Deferred:** Testcontainers ITs (Docker), `policies`/`customers` tables, Cognito issuer swap, RBAC roles
 
 ---
 
@@ -139,8 +146,9 @@ Anti-Corruption Layer protects the core domain from external data models.
 
 ```
 claimsflow360/
-├── pom.xml                             # AWS SDK v2 BOM + SQS + Bedrock + OpenSearch deps
+├── pom.xml                             # AWS SDK v2 BOM + SQS/Bedrock/OpenSearch/S3/Textract/SNS
 ├── docker-compose.yml                  # MySQL 8 for local dev (tests use H2)
+├── .github/workflows/ci.yml            # GitHub Actions: verify + JaCoCo gate [W4]
 └── src/
     ├── main/
     │   ├── java/com/claimsflow/
@@ -212,7 +220,35 @@ claimsflow360/
     │   │   │   ├── DashboardMetricsService.java          # FR-06
     │   │   │   ├── DashboardBroadcaster.java             # push to /topic/metrics
     │   │   │   ├── DashboardScheduler.java               # 10s heartbeat
-    │   │   │   └── DashboardController.java              # REST fallback
+    │   │   │   ├── DashboardController.java              # REST fallback
+    │   │   │   └── JwtStompChannelInterceptor.java       # CONNECT auth      [W4]
+    │   │   ├── document/                                # Documents BC (FR-07) [W4]
+    │   │   │   ├── domain/
+    │   │   │   │   ├── ClaimAttachment.java              # claim_documents entity
+    │   │   │   │   ├── AttachmentStatus.java             # upload/OCR lifecycle
+    │   │   │   │   └── ClaimAttachmentRepository.java
+    │   │   │   ├── application/DocumentService.java      # register→confirm→OCR
+    │   │   │   ├── infra/
+    │   │   │   │   ├── DocumentStorage.java              # port
+    │   │   │   │   ├── S3DocumentStorage.java            # presigned PUT (!test)
+    │   │   │   │   ├── StubDocumentStorage.java          # (test)
+    │   │   │   │   ├── OcrEngine.java                    # port
+    │   │   │   │   ├── TextractOcrEngine.java            # DetectDocumentText (!test)
+    │   │   │   │   └── StubOcrEngine.java                # (test)
+    │   │   │   └── api/DocumentController.java
+    │   │   ├── notification/                            # Notifications (FR-08) [W4]
+    │   │   │   ├── domain/
+    │   │   │   │   ├── Notification.java                 # notifications entity
+    │   │   │   │   ├── NotificationChannel.java          # EMAIL | SMS | IN_APP
+    │   │   │   │   ├── NotificationStatus.java           # PENDING|SENT|FAILED|DEAD
+    │   │   │   │   └── NotificationRepository.java
+    │   │   │   ├── application/
+    │   │   │   │   ├── NotificationService.java          # fanout on status change
+    │   │   │   │   └── NotificationDispatcher.java       # 5s delivery + retry/DLQ
+    │   │   │   └── infra/
+    │   │   │       ├── NotificationSender.java           # port
+    │   │   │       ├── SnsNotificationSender.java        # SNS topic (!test)
+    │   │   │       └── LoggingNotificationSender.java    # (test)
     │   │   └── shared/
     │   │       ├── config/
     │   │       │   ├── SecurityConfig.java
@@ -220,11 +256,17 @@ claimsflow360/
     │   │       │   └── aws/                             #                    [W2]
     │   │       │       ├── SqsConfig.java               # @Profile(!test)
     │   │       │       ├── BedrockConfig.java           # @Profile(!test)
-    │   │       │       └── OpenSearchConfig.java        # @Profile(!test)
+    │   │       │       ├── OpenSearchConfig.java        # @Profile(!test)
+    │   │       │       ├── S3Config.java                # presigner          [W4]
+    │   │       │       ├── TextractConfig.java          #                    [W4]
+    │   │       │       └── SnsConfig.java               #                    [W4]
+    │   │       ├── security/
+    │   │       │   └── AesGcmStringCryptoConverter.java  # PII field crypto  [W4]
     │   │       └── exception/
     │   │           ├── DomainException.java
     │   │           ├── ClaimNotFoundException.java
     │   │           ├── CustomerNotFoundException.java    #                   [W3]
+    │   │           ├── DocumentNotFoundException.java    #                   [W4]
     │   │           ├── InvalidClaimTransitionException.java
     │   │           ├── DuplicateClaimException.java
     │   │           └── GlobalExceptionHandler.java
@@ -233,7 +275,10 @@ claimsflow360/
     │       └── db/migration/
     │           ├── V1__init_schema.sql                  # claims, claim_events, fraud_evaluations
     │           ├── V2__add_outbox_events.sql             #                   [W2]
-    │           └── V3__add_ai_summaries.sql              #                   [W2]
+    │           ├── V3__add_ai_summaries.sql              #                   [W2]
+    │           ├── V4__add_claim_documents.sql           #                   [W4]
+    │           ├── V5__add_notifications.sql             #                   [W4]
+    │           └── V6__add_claimant_ssn.sql              #                   [W4]
     └── test/
         ├── java/com/claimsflow/
         │   ├── ClaimsFlow360ApplicationTests.java        # Spring context load (H2)
@@ -411,11 +456,40 @@ curl http://localhost:8080/api/v1/dashboard/metrics \
 
 ```javascript
 // WebSocket live metrics — STOMP client (e.g. @stomp/stompjs)
-const client = new StompJs.Client({ brokerURL: "ws://localhost:8080/ws" });
+// Week 4: the CONNECT frame must carry the same JWT as the REST API
+const client = new StompJs.Client({
+  brokerURL: "ws://localhost:8080/ws",
+  connectHeaders: { Authorization: "Bearer <JWT>" }
+});
 client.onConnect = () =>
   client.subscribe("/topic/metrics", msg => console.log(JSON.parse(msg.body)));
 client.activate();
 // Pushed on every consumed claim event + a 10s heartbeat
+```
+
+### Week 4 endpoints
+
+```bash
+# 1. Register a document — returns a presigned S3 PUT URL
+curl -X POST http://localhost:8080/api/v1/claims/CLM-XXXX/documents \
+  -H "Authorization: Bearer <JWT>" -H "Content-Type: application/json" \
+  -d '{"fileName":"hospital-report.pdf","contentType":"application/pdf","sizeBytes":204800}'
+
+# 2. Upload the file DIRECTLY to S3 (no auth header — the URL is the credential)
+curl -X PUT "<uploadUrl-from-step-1>" \
+  -H "Content-Type: application/pdf" --data-binary @hospital-report.pdf
+
+# 3. Confirm the upload, then trigger Textract OCR
+curl -X POST http://localhost:8080/api/v1/documents/1/confirm -H "Authorization: Bearer <JWT>"
+curl -X POST http://localhost:8080/api/v1/documents/1/ocr     -H "Authorization: Bearer <JWT>"
+
+# List a claim's documents (includes extracted OCR text)
+curl http://localhost:8080/api/v1/claims/CLM-XXXX/documents -H "Authorization: Bearer <JWT>"
+
+# Submit a claim with PII — SSN is AES-256 encrypted at rest, never echoed back
+curl -X POST http://localhost:8080/api/v1/claims \
+  -H "Authorization: Bearer <JWT>" -H "Content-Type: application/json" \
+  -d '{"policyNumber":"POL-001","claimantName":"Jane Doe","amountClaimed":1500.00,"ssn":"123-45-6789"}'
 ```
 
 ---
@@ -444,3 +518,12 @@ client.activate();
 12. **Why is Customer360 built from MySQL and not OpenSearch?** — Money totals shown to a policyholder must be strongly consistent; a 2-second-stale approved amount is a real complaint. A single policyholder has tens of claims — one indexed query — so the relational path is cheap. OpenSearch stays the engine for portfolio-wide search/analytics where staleness is acceptable.
 13. **Why does the reconciliation lookback (7 h) exceed the interval (6 h)?** — The overlap guarantees a claim updated moments before a sweep is still covered by the next one. Reconciliation over an idempotent upsert means over-projecting costs nothing; under-projecting is silent drift.
 14. **Why centralize `@EnableScheduling`?** — It was riding on `OutboxRelayScheduler`; deleting that one class would have silently disabled every other scheduled job. Cross-cutting switches belong in dedicated config, not on an arbitrary component.
+
+### Week 4
+
+15. **Why presigned URLs instead of proxying uploads?** — A 20 MB accident-photo upload through the API tier consumes a servlet thread, heap, and bandwidth for the whole transfer. Presigned PUT sends bytes directly to S3; the API only ever handles metadata. The URL is scoped to one key, one content type, 15 minutes.
+16. **Why is OCR failure not an error response?** — Textract extraction is *enrichment*, not a gate. `OCR_FAILED` is a re-triggerable state on the attachment; the claim proceeds regardless. Same fail-safe stance as the Bedrock fallback.
+17. **Why do notification rows commit with the claim transition?** — Same reasoning as the outbox: if the transition commits but the notification enqueue fails (or vice versa), you get silent gaps. One transaction, then async delivery — an SNS outage delays notifications but never blocks or rolls back a claim.
+18. **Why an in-table dead-letter instead of an SQS DLQ?** — The dispatcher already owns delivery state in MySQL; `status=DEAD` gives the same semantics (isolate poison, keep evidence, manual replay) plus free queryability for a support dashboard. An SQS DLQ earns its place when delivery moves to a real queue consumer.
+19. **Why AES-GCM with a random IV — and what does that cost?** — GCM gives authenticated encryption (tamper = decrypt fails loudly, never garbage). A random IV per write means identical SSNs produce different ciphertexts, so the column leaks nothing — but equality search is impossible *by design*. If lookup-by-SSN is ever needed: separate keyed-HMAC blind-index column, never deterministic encryption.
+20. **Why authenticate the STOMP CONNECT frame instead of the WS handshake?** — Browsers cannot set an `Authorization` header on the WebSocket upgrade request. The standard pattern: handshake stays open, the CONNECT frame carries the bearer token as a STOMP native header, and a `ChannelInterceptor` validates it with the same `JwtDecoder` as REST. One token, both transports; no subscriptions possible before auth.
