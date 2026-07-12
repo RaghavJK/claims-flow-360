@@ -79,6 +79,9 @@ claimsflow:
   security:
     dev-mode: true
     jwt-secret: "dev-secret-change-me-this-must-be-at-least-256-bits-long-for-hmac"
+    # AES-256 key for PII field encryption — base64 of 32 bytes.
+    # DEV ONLY. Production sources this from AWS Secrets Manager.
+    field-encryption-key: "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
 
   # ─── AWS (Week 2) ─────────────────────────────────────────────────────────
   aws:
@@ -88,6 +91,11 @@ claimsflow:
       consumer:                 # Week 3: long-poll consumer settings
         wait-time-seconds: 10   # SQS long-poll wait (max 20)
         max-messages: 10        # batch size per receive (max 10)
+    s3:                         # Week 4: document storage (FR-07)
+      documents-bucket: claimsflow-documents-dev
+      presign-expiry-minutes: 15
+    sns:                        # Week 4: notification fanout (FR-08)
+      notifications-topic-arn: arn:aws:sns:ap-south-1:123456789012:claimsflow-notifications
 
   opensearch:
     endpoint: http://localhost:9200             # local OpenSearch or AWS domain endpoint
@@ -109,6 +117,12 @@ claimsflow:
 
   dashboard:
     broadcast-interval-ms: 10000  # WebSocket metrics heartbeat
+
+  # ─── Week 4 ───────────────────────────────────────────────────────────────
+  notifications:
+    dispatch-interval-ms: 5000    # how often PENDING/FAILED notifications are delivered
+    max-retries: 3                # attempts before dead-lettering (status DEAD)
+    batch-size: 50
 
 logging:
   level:

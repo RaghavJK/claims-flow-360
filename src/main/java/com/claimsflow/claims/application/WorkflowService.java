@@ -6,6 +6,7 @@ import com.claimsflow.claims.domain.ClaimStatus;
 import com.claimsflow.claims.infra.messaging.ClaimEventPublisher;
 import com.claimsflow.claims.infra.persistence.ClaimEventRepository;
 import com.claimsflow.claims.infra.persistence.ClaimRepository;
+import com.claimsflow.notification.application.NotificationService;
 import com.claimsflow.shared.exception.ClaimNotFoundException;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
@@ -15,7 +16,8 @@ import java.math.BigDecimal;
 
 /**
  * Drives the claim state machine (FR-02). Each transition is persisted as an
- * immutable {@link ClaimEvent} and published for downstream projection.
+ * immutable {@link ClaimEvent}, published for downstream projection, and
+ * queues claimant notifications (FR-08) in the same transaction.
  */
 @Slf4j
 @Service
@@ -24,13 +26,16 @@ public class WorkflowService {
     private final ClaimRepository claimRepository;
     private final ClaimEventRepository claimEventRepository;
     private final ClaimEventPublisher eventPublisher;
+    private final NotificationService notificationService;
 
     public WorkflowService(ClaimRepository claimRepository,
                            ClaimEventRepository claimEventRepository,
-                           ClaimEventPublisher eventPublisher) {
+                           ClaimEventPublisher eventPublisher,
+                           NotificationService notificationService) {
         this.claimRepository = claimRepository;
         this.claimEventRepository = claimEventRepository;
         this.eventPublisher = eventPublisher;
+        this.notificationService = notificationService;
     }
 
     @Transactional
@@ -42,6 +47,7 @@ public class WorkflowService {
         ClaimEvent event = claimEventRepository.save(
                 ClaimEvent.transitioned(claim.getId(), from, target, actorId, reason));
         eventPublisher.publish(event);
+        notificationService.claimStatusChanged(claim, from, target);
         return claim;
     }
 

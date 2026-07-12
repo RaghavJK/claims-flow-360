@@ -20,6 +20,7 @@ claimsflow:
   security:
     dev-mode: true
     jwt-secret: "test-secret-change-me-this-must-be-at-least-256-bits-long-for-hmac"
+    field-encryption-key: "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
   ai:
     bedrock:
       model-id: anthropic.claude-3-haiku-20240307-v1:0

@@ -6,6 +6,7 @@ import com.claimsflow.claims.domain.ClaimStatus;
 import com.claimsflow.claims.infra.messaging.ClaimEventPublisher;
 import com.claimsflow.claims.infra.persistence.ClaimEventRepository;
 import com.claimsflow.claims.infra.persistence.ClaimRepository;
+import com.claimsflow.notification.application.NotificationService;
 import com.claimsflow.shared.exception.ClaimNotFoundException;
 import com.claimsflow.shared.exception.InvalidClaimTransitionException;
 import org.junit.jupiter.api.BeforeEach;
@@ -29,6 +30,7 @@ class WorkflowServiceTest {
     @Mock ClaimRepository claimRepository;
     @Mock ClaimEventRepository claimEventRepository;
     @Mock ClaimEventPublisher eventPublisher;
+    @Mock NotificationService notificationService;
 
     @InjectMocks WorkflowService service;
 
@@ -49,6 +51,7 @@ class WorkflowServiceTest {
         assertThat(result.getStatus()).isEqualTo(ClaimStatus.UNDER_REVIEW);
         verify(claimEventRepository).save(any(ClaimEvent.class));
         verify(eventPublisher).publish(any(ClaimEvent.class));
+        verify(notificationService).claimStatusChanged(existing, ClaimStatus.SUBMITTED, ClaimStatus.UNDER_REVIEW);
     }
 
     @Test
@@ -65,6 +68,7 @@ class WorkflowServiceTest {
                 .isInstanceOf(InvalidClaimTransitionException.class);
         verify(claimEventRepository, never()).save(any());
         verify(eventPublisher, never()).publish(any());
+        verifyNoInteractions(notificationService);
     }
 
     @Test

@@ -58,6 +58,9 @@ public class ClaimIngestionService {
                 cmd.claimantName(),
                 cmd.amountClaimed(),
                 cmd.description());
+        if (cmd.ssn() != null && !cmd.ssn().isBlank()) {
+            claim.provideSsn(cmd.ssn());   // encrypted at rest by the field converter
+        }
         Claim saved = claimRepository.save(claim);
 
         FraudScoreResult fraudResult = fraudScoringChain.score(saved);
@@ -86,6 +89,13 @@ public class ClaimIngestionService {
             String policyNumber,
             String claimantName,
             BigDecimal amountClaimed,
-            String description
-    ) {}
+            String description,
+            String ssn                     // optional; PII — encrypted at rest, never logged
+    ) {
+        /** Convenience for callers without PII. */
+        public IngestClaimCommand(String policyNumber, String claimantName,
+                                  BigDecimal amountClaimed, String description) {
+            this(policyNumber, claimantName, amountClaimed, description, null);
+        }
+    }
 }

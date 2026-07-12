@@ -1,6 +1,7 @@
 package com.claimsflow.claims.domain;
 
 import com.claimsflow.shared.exception.InvalidClaimTransitionException;
+import com.claimsflow.shared.security.AesGcmStringCryptoConverter;
 import jakarta.persistence.*;
 import lombok.Getter;
 import lombok.NoArgsConstructor;
@@ -50,6 +51,14 @@ public class Claim {
 
     @Column(name = "fraud_score")
     private Integer fraudScore;
+
+    /**
+     * Claimant SSN — AES-256-GCM encrypted at rest via the converter.
+     * Never exposed through the API; never logged.
+     */
+    @Convert(converter = AesGcmStringCryptoConverter.class)
+    @Column(name = "claimant_ssn", length = 512)
+    private String claimantSsn;
 
     @Column(name = "created_at", nullable = false, updatable = false)
     private Instant createdAt;
@@ -112,6 +121,18 @@ public class Claim {
         this.status = target;
         this.updatedAt = Instant.now();
         return previous;
+    }
+
+    /**
+     * Attaches the claimant's SSN. Optional at submission; encrypted at rest
+     * by the field converter.
+     */
+    public void provideSsn(String ssn) {
+        if (ssn != null && ssn.isBlank()) {
+            throw new IllegalArgumentException("ssn must not be blank when provided");
+        }
+        this.claimantSsn = ssn;
+        this.updatedAt = Instant.now();
     }
 
     public void assignFraudScore(int score) {
